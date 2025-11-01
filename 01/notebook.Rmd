@@ -1,0 +1,516 @@
+---
+title: "BI-PRS Semestral Project 1"
+authors:
+  - Oleksandr SLyvka
+  - Illia Lyhin
+  - Maksym Khavil
+output: html_document
+date: "2025-03-11"
+---
+
+# Semestral Project 1
+
+Our representative is Oleksandr Slyvka, his M-value is 6, that corresponds to Spain, thus we will investigate its data.
+
+## Libraries & Data
+
+The following libraries are used in this R Markdown notebook.
+
+```{R setup, include=FALSE}
+library(eurostat)
+library(dplyr)
+library(vtable)
+library(ggplot2)
+library(cowplot)
+library(e1071)
+library(tidyr)
+library(plotrix)
+# mapSpain requires sf
+# sf in turn requires libudunits2-dev libgdal-dev libgeos-dev libproj-dev
+library(mapSpain)
+```
+
+Now we will download dataset, and filter it to contain only information about employment in Spain regions in year 2022.
+
+```{R}
+# Raw data
+data <- get_eurostat("nama_10r_3empers")
+# Selection 2022 only
+data <- data[(as.Date('2022-01-01') <= data$TIME_PERIOD) & ( data$TIME_PERIOD < as.Date('2023-01-01')),]
+# Number of employed per a thousand citizens
+data <- data[(data$wstatus == 'EMP'),]
+# NUTS 3 regions in Spain
+data <- data[grepl('ES...', data$geo),]
+```
+
+We will combine **nace_r2** into four coarser categories *LARGE_BUSINESS*, *SMALL_BUSINESS*, *FINANCE* and *PUBLIC*. Dataset additionally prodvides accumulated *TOTAL* by region, so we will transform it into its own category.
+
+```{R}
+data$nace_cat <- "UNKOWN_CATEGORY"
+data[grepl("A|B|C|D|E|F", data$nace_r2),]$nace_cat   <- "LARGE_BUSINESS"
+data[grepl("G|H|I|J", data$nace_r2),]$nace_cat       <- "SMALL_BUSINESS"
+data[grepl("K|L|M|N", data$nace_r2),]$nace_cat       <- "FINANCE"
+data[grepl("O|P|Q|R|S|T|U", data$nace_r2),]$nace_cat <- "PUBLIC"
+data[grepl("TOTAL", data$nace_r2),]$nace_cat         <- "TOTAL"
+head(data)
+```
+
+We will aggregate all samples based on their **geo** and **nace_cat** feature, because they were split on **nace_r2** subtypes in raw datset.
+
+```{R}
+data <- aggregate(values ~ geo + nace_cat, data, sum)
+head(data)
+```
+
+Our data contains region *ESZZZ* , which is extra region in NUTS 3 and thus contain little statistical significance, but cause some computational problems, so we will remove it here.
+
+```{r}
+data <- data[data$geo != 'ESZZZ',]
+```
+
+Lastly we will convert **geo** and **nace_cat** into factors and rename **values** to **thousands_employed**.
+
+```{R}
+data$geo      <- as.factor(data$geo)
+data$nace_cat <- as.factor(data$nace_cat)
+colnames(data)[3] <- 'thousands_employed'
+head(data)
+```
+
+Let's separate unaccumulated NACE categories from *TOTAL*.
+
+```{R}
+data.geo.sep <- droplevels(data[data$nace_cat != "TOTAL",])
+head(data.geo.sep)
+```
+
+```{R}
+data.geo.acc <- droplevels(data[data$nace_cat == "TOTAL",])
+head(data.geo.acc)
+```
+
+## Data Description & Graphs
+
+Let's display the mean, standard deviation, median, interquartile range, and skewness with regard to the *TOTAL*.
+
+```{R warning=FALSE}
+summ <- c('mean(x)', 'sd(x)', 'skewness(x)', 'min(x)', 'pctile(x)[25]', 
+          'median(x)', 'pctile(x)[75]', 'max(x)', 'IQR(x)'
+)
+
+sumtable(
+  data.geo.acc, 'thousands_employed',
+  out='kable',
+  summ=summ
+)
+```
+
+We can see that data is strongly skewed to the right, that is, there are many samples with smaller than average employed population, also standard deviation and IQR are quite large (593 and 294 thousands people). It is reasonable, as Spain has both city-dense areas as Catalonia and rural regions like Iberian mountains. Next we will plot a histogram of those values.
+
+```{R}
+breaks <- seq(
+    min(data.geo.acc$thousands_employed), 
+    max(data.geo.acc$thousands_employed), 
+    length.out = 40
+)
+
+hist(
+    data.geo.acc$thousands_employed,
+    freq=FALSE, col=rgb(0.6,0,0, 0.6),
+    main = "Histogram of Accumulated values", xlab = "Thousands employed", ylab = "Density",
+    breaks=breaks, xlim=c(0, ceiling(max(data.geo.acc$thousands_employed)/1000)*1000)
+)
+```
+
+There are several samples on the far right, which can be thought of as outliers, most of data stay between $0$ and $1000$. Let's display whole dataset over a map, so we will get a real picture.
+
+```{R warning=FALSE}
+spain.nuts3 <- esp_get_nuts(nuts_level = 3, year = 2021)
+spain.data.acc <- spain.nuts3 %>% 
+  left_join(data.geo.acc, by = c("NUTS_ID" = "geo"))
+
+ggplot(spain.data.acc) +
+    geom_sf(aes(fill = thousands_employed), color = "white") +
+    geom_sf_label(
+        aes(label = NAME_LATN),
+        size=2
+    ) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    theme_minimal() +
+    theme(
+        legend.key.height = unit(1.5, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.title = element_text(size = 12)
+    ) +
+    labs(title = "Accumulated Data Across Spanish NUTS-3 Regions", fill = "1K employed") +
+    theme_minimal()
+```
+
+It is clear that Madrid and Barcelona are dominating in employment rates. They are two biggest cities in Spain with far-spread aglomearion, so they stand far apart from the other country.
+
+We will now dig into NACE category differences.
+
+```{R warning=FALSE}
+sumtable(
+  data.geo.sep, 'thousands_employed',
+  out='kable',
+  summ=summ,
+  group='nace_cat',  group.long=TRUE
+)
+```
+
+Visually *SMALL_BUSSINESS*, *LARGE_BUSINESS* and *PUBLIC* categories employ many more people than *FINANCE*. Additionally all categories show very similar skewness, so it could be expected that they match. Let us create histograms of different NACE categories.
+
+```{R}
+pfin <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'FINANCE',],
+        aes(x=thousands_employed)
+    )   +
+        geom_histogram() +
+        ggtitle("FINANCE")
+
+psmall <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'SMALL_BUSINESS',],
+        aes(x=thousands_employed)
+    )   +
+        geom_histogram() +
+        ggtitle("SMALL_BUSINESS")
+
+
+ppub <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'PUBLIC',],
+        aes(x=thousands_employed)
+    )   +
+        geom_histogram() +
+        ggtitle("PUBLIC")
+
+
+plarge <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'LARGE_BUSINESS',],
+        aes(x=thousands_employed)
+    )   +
+        geom_histogram() +
+        ggtitle("LARGE_BUSINESS")
+
+plot_grid(pfin, psmall, ppub, plarge)
+```
+
+Individual plots follow accumulated values shapes, but they have shifted peaks, so it resembles bell curve, so they can be normal.
+
+Let's Make Q-Q plots to see if those variables are normal.
+
+```{R}
+pfin <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'FINANCE',],
+        aes(sample=thousands_employed)
+    )   +
+        stat_qq(distribution=qnorm, show.legend=T) +
+        stat_qq_line(distribution=qnorm, show.legend=F) +
+        ggtitle("FINANCE")
+
+psmall <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'SMALL_BUSINESS',],
+        aes(sample=thousands_employed)
+    )   +
+        stat_qq(distribution=qnorm, show.legend=T) +
+        stat_qq_line(distribution=qnorm, show.legend=F) +
+        ggtitle("SMALL_BUSINESS")
+
+
+ppub <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'PUBLIC',],
+        aes(sample=thousands_employed)
+    )   +
+        stat_qq(distribution=qnorm, show.legend=T) +
+        stat_qq_line(distribution=qnorm, show.legend=F) +
+        ggtitle("PUBLIC")
+
+
+plarge <- ggplot(
+        data.geo.sep[data.geo.sep$nace_cat == 'LARGE_BUSINESS',],
+        aes(sample=thousands_employed)
+    )   +
+        stat_qq(distribution=qnorm, show.legend=T) +
+        stat_qq_line(distribution=qnorm, show.legend=F) +
+        ggtitle("LARGE_BUSINESS")
+
+plot_grid(pfin, psmall, ppub, plarge)
+```
+
+All Q-Q plots diverge from normal quantile line at the edges and explodes in positive side. We could say that those distributions are not normal, later normality can be tested by numerical methods.
+
+Let's plot Individual NACE supcategories over a map.
+
+```{R warning=FALSE}
+spain.data.geo_tmp <- spain.nuts3 %>% 
+  left_join(data.geo.sep[data.geo.sep$nace_cat == 'FINANCE',], by = c("NUTS_ID" = "geo"))
+ggplot(spain.data.geo_tmp) +
+    geom_sf(aes(fill = thousands_employed), color = "white") +
+    geom_sf_label(
+        aes(label = NAME_LATN),
+        size=2
+    ) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    theme_minimal() +
+    theme(
+        legend.key.height = unit(1.5, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.title = element_text(size = 12)
+    ) +
+    labs(title = "Data Across Spanish NUTS-3 Regions in FINANCE", fill = "1K employed") +
+    theme_minimal()
+```
+
+```{R warning=FALSE}
+spain.data.geo_tmp <- spain.nuts3 %>% 
+  left_join(data.geo.sep[data.geo.sep$nace_cat == 'SMALL_BUSINESS',], by = c("NUTS_ID" = "geo"))
+ggplot(spain.data.geo_tmp) +
+    geom_sf(aes(fill = thousands_employed), color = "white") +
+    geom_sf_label(
+        aes(label = NAME_LATN),
+        size=2
+    ) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    theme_minimal() +
+    theme(
+        legend.key.height = unit(1.5, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.title = element_text(size = 12)
+    ) +
+    labs(title = "Data Across Spanish NUTS-3 Regions in SMALL_BUSINESS", fill = "1K employed") +
+    theme_minimal()
+```
+
+```{R warning=FALSE}
+spain.data.geo_tmp <- spain.nuts3 %>% 
+  left_join(data.geo.sep[data.geo.sep$nace_cat == 'PUBLIC',], by = c("NUTS_ID" = "geo"))
+ggplot(spain.data.geo_tmp) +
+    geom_sf(aes(fill = thousands_employed), color = "white") +
+    geom_sf_label(
+        aes(label = NAME_LATN),
+        size=2
+    ) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    theme_minimal() +
+    theme(
+        legend.key.height = unit(1.5, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.title = element_text(size = 12)
+    ) +
+    labs(title = "Data Across Spanish NUTS-3 Regions in PUBLIC", fill = "1K employed") +
+    theme_minimal()
+```
+
+```{R warning=FALSE}
+spain.data.geo_tmp <- spain.nuts3 %>% 
+  left_join(data.geo.sep[data.geo.sep$nace_cat == 'LARGE_BUSINESS',], by = c("NUTS_ID" = "geo"))
+ggplot(spain.data.geo_tmp) +
+    geom_sf(aes(fill = thousands_employed), color = "white") +
+    geom_sf_label(
+        aes(label = NAME_LATN),
+        size=2
+    ) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    theme_minimal() +
+    theme(
+        legend.key.height = unit(1.5, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        legend.title = element_text(size = 12)
+    ) +
+    labs(title = "Data Across Spanish NUTS-3 Regions in LARGE_BUSINESS", fill = "1K employed") +
+    theme_minimal()
+```
+
+All NACE supercategories behave very similiarly. Madrid and Barcelona spike in number of people employed, Valencia is the strongest in the rest of Spain.
+
+## Contingency table
+
+We will create contingency table over all NUTS 3 regions and all NACE categories.
+
+```{R}
+ct <- addmargins(xtabs(formula=thousands_employed ~ geo + nace_cat, data.geo.sep))
+ct
+```
+
+Let's test if regions have the same distribution of employment. Pearson's Chi Squared Homogeneity Test will assist us in that (the condition of having 5 or more expected counts in 80% of cells in large table is met).
+
+$$
+H_0: \text{Employment does not depend on a region}\\
+H_A: \text{Employment does depend on a region}
+$$
+
+```{R warning=FALSE}
+ct_test <- xtabs(formula=thousands_employed ~ geo + nace_cat, data.geo.sep)
+print(head(ct_test, 3))
+chisq.test(ct_test)
+```
+
+p-value is much less than $\alpha = 0.05$, so we reject the null hypothesis in favor of the alternative. Conclusion is that the proportions of people employed in distinct categories are **not the same** for different regions.
+
+## Tests
+
+Let's extend our data a bit before making further hypotheses by using a dataset about the population in NUTS 3 regions.
+
+```{r}
+# population density by NUTS 3 regions
+pop_dens_nuts3 <- get_eurostat("demo_r_d3dens")
+pop_dens_nuts3 <- pop_dens_nuts3[(as.Date('2022-01-01') <= pop_dens_nuts3$TIME_PERIOD) & ( pop_dens_nuts3$TIME_PERIOD < as.Date('2023-01-01')),]
+pop_dens_nuts3 <- pop_dens_nuts3[grepl('ES...', pop_dens_nuts3$geo),]
+
+# area by NUTS 3 regions
+area_nuts3 <- get_eurostat("reg_area3")
+area_nuts3 <- area_nuts3[(as.Date('2022-01-01') <= area_nuts3$TIME_PERIOD) & ( area_nuts3$TIME_PERIOD < as.Date('2023-01-01')),]
+area_nuts3 <- area_nuts3[grepl('ES...', area_nuts3$geo),]
+area_nuts3 <- area_nuts3[area_nuts3$landuse == 'TOTAL',]
+
+area <- area_nuts3[, c("geo", "values")]
+pop_dens <- pop_dens_nuts3[, c("geo", "values")]
+
+# combining two together
+merged_data <- merge(pop_dens, area, by = "geo", suffixes = c("_pop_dens", "_area"))
+merged_data$product <- merged_data$values_pop_dens * merged_data$values_area
+population <- merged_data[, c("geo", "product")]
+colnames(population)[colnames(population) == "product"] <- "pop_in_thousands"
+population$pop_in_thousands <- population$pop_in_thousands / 1000
+
+# population by regions in thousands
+head(population)
+```
+
+### Existence of correlation between employment and population
+
+Let's check hypothesis:
+
+$$
+H_0: \text{Correlation between employment and population is 0 }\\
+H_A: \text{Correlation is not 0}
+$$
+
+First we can combine total employment and population in one table to predict how the test can end.
+
+```{r}
+data.corr.test = merge(data.geo.acc, population, by='geo')
+head(data.corr.test, 5)
+```
+
+It seems like 40% of the population in each region is employed. If all assumptions are met, we can use Pearson correlation test to check the linear relationship. One of the assumptions is normality of both variables. Let's test it with Shapiro-Wilk test:
+
+```{r}
+shapiro.test(data.corr.test$thousands_employed)
+shapiro.test(data.corr.test$pop_in_thousands)
+```
+
+As we see, test rejects the null hypothesis of normality in both cases, meaning that we should use non-parametric test, which can be, for example, Spearman correlation test. It requires variables to have monotonic relationship, which holds, based on our observation.
+
+```{r}
+cor.test(data.corr.test$thousands_employed, data.corr.test$pop_in_thousands, method='spearman', alternative = "two.sided")
+```
+
+p-value is low, so we reject the null hypothesis. Result of the test also indicates almost perfect positive correlation between variables.
+
+### **Testing if SMALL_BUSINESS** and **PUBLIC** come hand-in-hand in all regions
+
+Looking at the data we can suppose that in each region employment in **SMALL_BUSINESS** is equal to the employment in **PUBLIC** in the region. This lead to the hypotheses:
+
+$$
+H_0: \text{Employment levels in SMALL_BUSINESS and PUBLIC are similar}\\
+H_A: \text{One category tends to have higher employment than the other}
+$$
+
+This can be tested with a paired test. But the choice of the test depends on the distribution of differences of the values. If it is normal, we can use stronger paired t-test, if it is at least symmetric, we would use non-parametric test: Wilcox signed-rank test. And if we cannot use neither of them, we would go for signed test.
+
+```{r}
+# Transforming data with NACE categories to wide format for convenient use
+data.sep.wide <- 
+  pivot_wider(data.geo.sep, names_from = nace_cat, values_from = thousands_employed)
+head(data.sep.wide, 2)
+```
+
+Let's test the normality with Shapiro-Wilk normality test:
+
+```{r}
+shapiro.test(data.sep.wide$PUBLIC - data.sep.wide$SMALL_BUSINESS)
+```
+
+Test indicates, that the differences are unlikely to be normal.
+
+Next is symmetry:
+
+```{r}
+hist(data.sep.wide$PUBLIC - data.sep.wide$SMALL_BUSINESS, main = "Histogram of Differences", xlab = "Differences", breaks = 20)
+```
+
+```{r}
+cat("Differences distribution skewness:", skewness(data.sep.wide$PUBLIC - data.sep.wide$SMALL_BUSINESS))
+```
+
+As we see the differences has non-zero skewness and thus our only option is Sign test. From the histogram we can notice that differences are mostly positive, and thus we will assume that employment in **PUBLIC** can be greater. Let's denote (**PUBLIC**, **SMALL_BUSINESS**) pairs as $(X_i, Y_i)$. Our hypotheses fitted on Sign test are:
+
+$$
+H_0: \text{The median of the $X_i - Y_i$ is 0}\\
+H_A: \text{The median of the differences is greater than 0}
+$$
+
+```{r}
+differences <- data.sep.wide$PUBLIC - data.sep.wide$SMALL_BUSINESS
+public_higher <- sum(differences > 0)
+regions_cnt <- length(differences)
+
+# Perform the Sign Test using binomial test
+binom.test(public_higher, regions_cnt, p = 0.5, alternative = "greater")
+```
+
+p-value now is not as low as in the previous tests, but still we reject null hypothesis under significance level of 5%. This means that we can expect employment in **PUBLIC** to be greater in regions.
+
+### **SMALL_BUSINESS** and LARGE_BUSINESS distribution comparison
+
+It's important to test the distributions of employment to know, for example, if workers have equal access to job opportunities across both small and large businesses. Let's plot histograms of those variables.
+
+```{R}
+cat1 <- "SMALL_BUSINESS"
+cat2 <- "LARGE_BUSINESS"
+
+data.ct.test = droplevels(data.geo.sep[data.geo.sep$nace_cat %in% c(cat1, cat2),])
+
+breaks <- seq(
+    min(data.ct.test$thousands_employed), 
+    max(data.ct.test$thousands_employed), 
+    length.out = 40
+)
+
+hist(
+    data.ct.test[data.ct.test$nace_cat == cat1,]$thousands_employed,
+    freq=FALSE, col=rgb(0.6,0,0, 0.6),
+    main = "Histograms", xlab = "Thousands employed", ylab = "Density",
+    breaks=breaks
+)
+
+hist(
+    data.ct.test[data.ct.test$nace_cat == cat2,]$thousands_employed,
+    freq=FALSE, col=rgb(0,0,0.6, 0.6), add=TRUE,
+    breaks=breaks
+)
+
+legend("topright", legend = c(cat1, cat2),
+       fill = c(rgb(0.6,0,0, 0.6), rgb(0,0,0.6, 0.6))
+       )
+```
+
+Distributions look similar. Let's formulate our hypothesis. For region let $F$ be the distribution of employed people in **SMALL_BUSINESS** and $G$ be a distribution of people employed in **LARGE_BUSINESS**, then our hypotheses are:
+
+$$
+H_0: F = G\\
+H_A: F \neq G
+$$
+
+We will use Kolmogorov-Smirnov test, which is more suitable for comparison of the distribution shapes. Mann-Whitney U test would be more focused on comparing central tendencies.
+
+```{r}
+ks.test(data.sep.wide$SMALL_BUSINESS, data.sep.wide$LARGE_BUSINESS)
+```
+
+p-value is greater than $α=0.05$, so we fail to reject the null hypothesis and cannot conclude that the distributions are different.
+
+## Conclusion
+
+Our research provided valuable insights into the population of Spain, contributing to a broader understanding of employment trends in European countries. Even though our findings lack practical significance, the project was highly beneficial for study purposes, as it not only deepened our understanding of statistics but also enhanced our proficiency in the R language.

@@ -1,0 +1,702 @@
+---
+title: "notebook"
+output: html_document
+authors:
+    - Oleksand Slyvka
+    - Illia Lyhin
+    - Maksym Khavil
+date: "2025-04-30"
+---
+
+We have chosen Oleksandr Slyvka as our representative, his M value is 6. This gives us year 2018 to analyse.
+
+## Libraries
+
+```{r setup, include=TRUE}
+library(eurostat)
+library(ggplot2)
+library(cowplot)
+library(corrplot)
+library(vtable)
+library(grid)
+library(sf)
+library(dplyr)
+library(rnaturalearth)
+# install.packages("remotes")
+# remotes::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+library(countrycode)
+library(car)
+library(lmtest)
+library(e1071)
+```
+
+## Importing & Explaining Average Salary
+
+```{r}
+data <- get_eurostat("nama_10_fte", time_format = "num")
+data <- data[(data$unit == "EUR") & (data$TIME_PERIOD == 2018),]
+data <- data[c("geo", "values")]
+data
+```
+
+Our data includes records for *Euro Area (EA20)* and *European Union (EU27_2020)*, more over those are records that had not came from year 2018. Those are not standalone countries, so we better delete them. Also it uses *EL* for Greece (Ellada), we will rename it. Also we have no possession of a record for Netherlands.
+
+Lastly we will replace country codes with country names.
+
+```{r}
+data <- data[(data$geo != "EA20") & (data$geo != "EU27_2020"),]
+data[(data$geo == "EL"), "geo"] <- "GR"
+data$geo <- countrycode(data$geo, origin = 'iso2c', destination = 'country.name')
+data
+```
+
+Let us define a generic function that will help us display data on a map of European Union.
+
+```{r warning=FALSE}
+world_map <- ne_countries(scale = "large", returnclass = 'sf')
+europe_bbox <- st_bbox(c(xmin = -20, xmax = 40, ymax = 75, ymin = 30), crs = st_crs(4326))
+eu_map <- world_map %>% filter(name %in% data$geo) %>%  st_crop(europe_bbox)
+
+plot_eu <- function(mydata, col, by_data="geo", by_map="name") {
+    disp <- left_join(eu_map, mydata, by = setNames(by_data, by_map))
+    return (ggplot(disp) +  geom_sf(aes(fill=.data[[col]])) + theme_minimal())
+}
+```
+
+Now we will take a look at a map with **Average Salaries**, histogram of the variable and summary of mean, standard deviation, limits, quartiles and IQR.
+
+```{r}
+hist(data$values, main="Histogram of Average Salary (EUR)", col="cyan")
+plot_eu(data, "values") +
+    scale_fill_viridis_c(
+      name="Average Salary (EUR)", 
+      guide = guide_colorbar(barheight = 15, barwidth = 1),
+      breaks=10000*(1:6)
+    )
+
+
+```
+
+We can see that employees in countries on the east are generally paid less. Histogram shows that the distribution is bimodal with two intervals (10-30k and 40-50k), where most countries concentrate.
+
+```{r}
+data %>% slice_max(order_by = values, n = 7)
+summ <- c('mean(x)', 'sd(x)', 'skewness(x)',  'min(x)', 'pctile(x)[25]',
+          'median(x)', 'pctile(x)[75]', 'max(x)', 'IQR(x)'
+)
+sumtable(
+  data, 'values',
+  out='kable',
+  summ=summ
+)
+```
+
+Mean is 28k euros, while median is only 22k. From skewness value and max value we might expect that there are some countries where employees are paid a lot higher. Our table with top 7 countries by **Average Salaries** shows that those countries are **Luxemburg** and **Denmark**, first one is famous for its banks and Denmark is known to be a money harbor for its stability and location.
+
+## Regressors' Descriptions
+
+### Distance to Voronezh
+
+Our first regressor will be a distance between country's capital and city of Voronezh. We expect it to positively correlate with **Average Salary**. To construct such feature we would first get coordinates of each country's capital.
+
+```{r}
+# Load populated places, including capitals
+places <- ne_download(scale = "small", type = "populated_places", category = "cultural", returnclass = "sf")
+capitals <- places %>%
+  filter(FEATURECLA == "Admin-0 capital", ADM0NAME %in% data$geo)
+
+# View capital names and coordinates
+capital_coords <- capitals %>% select(name = NAME, country = ADM0NAME, geometry)
+
+capital_coords <- capital_coords %>%
+  mutate(
+    lon = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  )
+```
+
+With coordinates on our hand we will compute the distance using `st_distance` function from `sf`. This implementation accounts for Earth's curvature and computes spherical distance.
+
+```{r}
+points <- st_as_sf(capital_coords, capital_coords = c("lon", "lat"), crs = 4326)
+
+voronezh <- st_sfc(st_point(c(51.67204, 39.1843)), crs = 4326)
+
+points$distance_to_voronezh <- as.numeric(st_distance(points, voronezh)) / 1000
+points <- as.data.frame(points)[c("country", "distance_to_voronezh")]
+points
+data <- left_join(data, points, by=setNames("country","geo"))
+data
+```
+
+Let us do a quick data analysis of the variable. This will include drawing a map of it, its histogram, basic descriptive statistics and a scatter plot against **Average Salary**.
+
+```{r}
+plot_eu(data, "distance_to_voronezh") +
+    scale_fill_gradient(
+        name = "Distance to voronezh (km)",
+        low = "black", high = "white" 
+    ) +
+    guides(fill = guide_colorbar(barwidth = 1, barheight = 15))
+
+hist(
+    data$distance_to_voronezh, 
+    main="Histogram of distance to Voronezh (km)",
+    xlab="distance to Voronezh (km)",
+    col="gray",
+    breaks=1000 * (1:6)
+)
+
+plot(
+    data$distance_to_voronezh, data$values,
+    main=sprintf("Distance to Voronezh (km) X Average Salary (r=%.2f)", cor(data$distance_to_voronezh, data$values)),
+    xlab="Distance to Voronezh (km)",
+    ylab="Average Salary",
+    col="black", pch=19
+)
+
+sumtable(
+  data, 'distance_to_voronezh',
+  out='kable',
+  summ=summ,
+  factor.numeric = TRUE
+)
+```
+
+This variable is purely geographical, so we obtain a white-to-black gradient spanning all Europe. Histogram is skewed to the right, it is a result of greater number of countries located on the east of EU. As we have expected **Distance to Voronezh** correlates positively with **Average Salary**, Pearson's coefficient is not large (see scatter plot, coefficient is less than 0.5), but it shows a connection, that the further away a country is from Voronezh, the higher Salary can be expected. Lastly, descriptive statistics agree with an observation about histogram and show a skewness of $0.67$, a mean of $3200$ and a standard deviation of $776$ kilometers.
+
+### Illia Lyhin's preference to visit named country for a leisure week (on 01.05.2018 at 16:00)
+
+Illia Lyhin, being one of the authors of this project, is an inveterate traveller, so surely he has an opinion whether he wants to visit a country or not. We assume it is a good indication about country's **Average Salary**, as Mr. Lyhin is rarely happens to be wrong about topics touching monetary relationship. Below we present his view.
+
+```{r}
+lyhin_lvls = c("Low", "Medium", "High")
+
+data$lyhin_preference = "Medium"
+data[data$geo %in% c("Austria", "Cyprus", "Czechia", "Denmark", "Ireland", "Portugal"),]$lyhin_preference = "High"
+data[data$geo %in% c("Belgium", "Bulgaria", "Hungary", "Romania", "Slovakia", "Lithuania", "Latvia"),]$lyhin_preference = "Low"
+data$lyhin_preference <- factor(data$lyhin_preference, levels=lyhin_lvls, ordered=TRUE)
+data
+```
+
+With data on our hands let us plot it.
+
+```{r}
+
+color.low = "#EFEA90"
+color.mid = "#DFD420"
+color.hig = "#B6AC1A"
+
+plot_eu(data, "lyhin_preference") +
+  scale_fill_manual(
+    name = "Illia Lyhin's Preference",
+    values = c(
+      "Low" = color.low,
+      "Medium" = color.mid,
+      "High" = color.hig
+    )
+  )
+
+par(mar = c(5, 4, 4, 8), xpd = TRUE)
+boxplot(
+    values ~ lyhin_preference, data=data,
+    main="Average Salary by Illia Lyhin's Preference",
+    ylab="Average Salary",
+    xlab="Illia Lyhin's Preference",
+    col=c(color.low, color.mid, color.hig)
+)
+
+data %>%
+  group_by(lyhin_preference) %>%
+  summarise(
+    count = n(),
+    mean = mean(values),
+    sd = sd(values),
+    min = min(values),
+    median=median(values),
+    max = max(values)
+  )
+```
+
+There is nothing to note about individual records, except excellent choices for a vacation. Box plots show that low priority countries have, indeed, lower **Average Salary**, though there is an outlier, which is Belgium. Medium and high priority countries behave very similarly. High has a larger spread with standard deviation of $18.5k$ euros.
+
+### Number of people in penitentiary system
+
+One could hypothesize that **Average Salary** is a measure of stability and well-being. A number of people in the penitentiary system can be another measure of those qualities. It is usually expected that prosperous countries have less crime, so prisons are not as full as those in developing countries. We will use [crim_pris_age](https://ec.europa.eu/eurostat/databrowser/view/CRIM_PRIS_AGE/default/table?lang=en&category=crim.crim_pris) Eurostat dataset for this data, which provides more data than we need, so we will select only the necessary rows. The criteria are year 2018 and total population (both in terms of sex and age). Also, we can choose between different units, we have decided on "Per hundred thousands inhabitants", because it is a relative measure, so it is adequate to compare it between different countries. We expect **Prisoners per 100K** to negatively correlate with **Average Salary**.
+
+```{r warning=FALSE}
+crim <- get_eurostat("crim_pris_age")
+crim <- crim[(crim$age == "TOTAL") & (crim$sex == "T") & (as.Date('2018-01-01') <= crim$TIME_PERIOD) & (crim$TIME_PERIOD < as.Date('2019-01-01')) & (crim$unit == "P_HTHAB"),]
+crim[(crim$geo == "EL"), "geo"] <- "GR"
+crim$geo <- countrycode(crim$geo, origin = 'iso2c', destination = 'country.name')
+crim <- crim[c("geo", "values")] %>% rename(prisoners_per_100K=values)
+data <- left_join(data, crim, by="geo")
+data
+```
+
+We will conduct the same data analysis for **Prisoners per 100K** as we have done for **Distance to Voronezh**.
+
+```{r}
+plot_eu(data, "prisoners_per_100K") +
+    scale_fill_gradient(
+        name = "Prisoners per 100K",
+        low = "white", high = "red" 
+    ) +
+    guides(fill = guide_colorbar(barwidth = 1, barheight = 15))
+
+hist(data$prisoners_per_100K, main="Histogram of Prisoners per 100K", col="red", xlab="Prisoners per 100K")
+
+plot(
+    data$prisoners_per_100K, data$values,
+    main=sprintf("Prisoners per 100K X Average Salary (r=%.2f)", cor(data$prisoners_per_100K, data$values)),
+    xlab="Prisoners per 100K",
+    ylab="Average Salary",
+    col="red", pch=19
+)
+
+sumtable(
+  data, 'prisoners_per_100K',
+  out='kable',
+  summ=summ,
+  factor.numeric = TRUE
+)
+```
+
+The number of prisoners is much higher in Eastern countries. As a result distribution is skewed right with a mean $120$, a median $104$ and a standard deviation of $51$ prisoners per hundred thousands inhabitants. This regressor correlates with **Average Salary** even stronger than **Distance to Voronezh**(r=-0.55). We can also output countries with lowest and highest prisoners ratio:
+
+```{r}
+data[c(which.min(data$prisoners_per_100K),which.max(data$prisoners_per_100K)), c('geo', 'values','prisoners_per_100K')]
+```
+
+### Most Profitable NACEr2 A10 Cateogry
+
+We will use one more categorical feature, the most profitable NACEr2 A10 category. It must differentiate between differently structured economies, as different countries have different sources of profit. For that, we will use [nama_10_a10](https://ec.europa.eu/eurostat/databrowser/view/nama_10_a10/default/table?lang=en) Eurostat dataset. Categories presented in this dataset are not disjoint, but we will categorize them as a part of a bigger union of sectors. As a unit of measure we will use Percents of GDP to stay relative to countries' scale.
+
+```{r}
+nace <- get_eurostat("nama_10_a10", select_time="A")
+nace2 <- nace[(nace$na_item == "B1G") & (as.Date('2018-01-01') <= nace$TIME_PERIOD) & (nace$TIME_PERIOD < as.Date('2019-01-01')) & (nace$unit == "PC_GDP"),]
+nace2 <- nace2 %>% filter(nace_r2 != "TOTAL")
+nace2 <- nace2 %>%
+  mutate(nace_r2_sector = dplyr::recode(nace_r2,
+    "A"   = "Agriculture, forestry and fishing",
+    "B-E" = "Industry",
+    "F"   = "Construction",
+    "G-I" = "Wholesale, retail, transport, accommodation",
+    "J"   = "Information and communication",
+    "K"   = "Financial and insurance activities",
+    "L"   = "Real estate activities",
+    "M-N" = "Professional & admin services",
+    "O-Q" = "Public administration, education, health",
+    "R-U" = "Arts, entertainment, other services"
+  ))
+nace2 <- nace2 %>% group_by(geo) %>% top_n(1,values) %>% select(geo, nace_r2_sector)
+nace2[(nace2$geo == "EL"), "geo"] <- "GR"
+nace2$geo <- countrycode(nace2$geo, origin = 'iso2c', destination = 'country.name')
+data <- left_join(data, nace2, by="geo")
+nace_r2_lvls =sort(unique(data$nace_r2_sector))
+data$nace_r2_sector <- factor(data$nace_r2_sector, levels=nace_r2_lvls, ordered = FALSE)
+unique(data$nace_r2)
+data
+```
+
+Let us now display those classes and the **Average Salary** in them.
+
+```{r}
+color.fin = "#E77D88"
+color.ind = "#BDE77D"
+color.pub = "#7DE7DC"
+color.ret = "#A77DE7"
+
+plot_eu(data, "nace_r2_sector") +
+  scale_fill_manual(
+    name = "Most Profitable NACE2 A10 Categories",
+    values = c(
+      "Financial and insurance activities" = color.fin,
+      "Industry" = color.ind,
+      "Public administration, education, health" = color.pub,
+      "Wholesale, retail, transport, accommodation" = color.ret
+    )
+  )
+
+data.nace2.fin = data[data$nace_r2_sector == "Financial and insurance activities",]
+data.nace2.ind = data[data$nace_r2_sector == "Industry",]
+data.nace2.pub = data[data$nace_r2_sector == "Public administration, education, health",]
+data.nace2.ret = data[data$nace_r2_sector == "Wholesale, retail, transport, accommodation",]
+
+par(mar = c(5, 4, 4, 8), xpd = TRUE)
+boxplot(
+    values ~ nace_r2_sector, data=data,
+    col=c(color.fin, color.ind, color.pub, color.ret),
+    main="Average Salary by Most Profitable NACE2 A10 Categories",
+    ylab="Average Salary",
+    xaxt='n'
+)
+
+legend(
+    "topright", inset=c(-0.2, 0),
+    legend = c("Finance", "Industry", "Administration", "Wholesale"), 
+    fill = c(color.fin, color.ind, color.pub, color.ret), 
+    title = "NACE2 A10 Categories"
+)
+
+data %>%
+  group_by(nace_r2_sector) %>%
+  summarise(
+    count = n(),
+    mean = mean(values),
+    sd = sd(values),
+    min = min(values),
+    median=median(values),
+    max = max(values)
+  )
+```
+
+Most countries fall into 3 categories: *Industry*, *Administration* and *Wholesale,* with Luxembourg alone holding to *Finance*. This leads to a flattened boxplot of **Finance**. Pooled average of *Administration* is the highest, with *Industry* coming second, and *Wholesale* coming last. *Industry* sector also shows the biggest spread with a standard deviation of $16k$ euros.
+
+### Daily Internet Use (%)
+
+Our fifth feature is **Daily Internet Use** coming from the Eurostat dataset [isoc_ci_ifp_fu](https://ec.europa.eu/eurostat/databrowser/view/isoc_ci_ifp_fu/default/table?lang=en). We have no expectation for this variable to be related to **Average Salary**, because internet connection is both cheap and widespread.
+
+```{r}
+ifp <- get_eurostat("isoc_ci_ifp_fu")
+ifp <- ifp[(as.Date('2018-01-01') <= ifp$TIME_PERIOD) & (ifp$TIME_PERIOD < as.Date('2019-01-01')) & (ifp$unit == "PC_IND") & (ifp$indic_is == "I_IDAY") & (ifp$ind_type == "IND_TOTAL"),]
+ifp[(ifp$geo == "EL"), "geo"] <- "GR"
+ifp$geo <- countrycode(ifp$geo, origin = 'iso2c', destination = 'country.name')
+ifp <- ifp[c("geo", "values")] %>% rename(daily_internet_usage_pc=values)
+data <- left_join(data, ifp, by="geo")
+data
+```
+
+```{r}
+plot_eu(data, "daily_internet_usage_pc") +
+    scale_fill_gradient(
+        name = "Daily Internet Usage (%)",
+        low = "cyan", high = "darkgreen" 
+    ) +
+    guides(fill = guide_colorbar(barwidth = 1, barheight = 15))
+
+hist(
+    data$daily_internet_usage_pc, 
+    main="Histogrma of Daily Internet Usage (%)", 
+    col="darkgreen", 
+    xlab="Daily Internet Usage (%)",
+    breaks=(10 * (0:5)) + 50
+)
+
+plot(
+    data$daily_internet_usage_pc, data$values,
+    main=sprintf("Daily Internet Usage (%%) X Average Salary (r=%.2f)", cor(data$daily_internet_usage_pc, data$values)),
+    xlab="Daily Internet Usage (%)",
+    ylab="Average Salary",
+    col="darkgreen", pch=19
+)
+
+sumtable(
+  data, 'daily_internet_usage_pc',
+  out='kable',
+  summ=summ,
+  factor.numeric = TRUE
+)
+```
+
+**Daily Internet Usage** has a normal-looking distribution with a heart of online activity in Denmark. Surprisingly, internet usage has a strong positive linear correlation with **Average Salary** maybe because internet makes dealing with tasks more convenient and thus workers can achieve tasks completion faster.
+
+Let us take a look at the data on our hands and proceed to investigate dependencies between the regressors.
+
+```{r}
+data
+```
+
+### Testing Regressors' relationship
+
+We will first test relationships between numerical regressors. Dependence between them can be explained with correlation. Pearson correlation will be partially tested during checking multicollinearity, so we will test monotonic relationship for all pairs of numerical regressors with Spearman correlation test:
+
+```{r}
+cor.test(data$distance_to_voronezh, data$prisoners_per_100K, method = "spearman")
+cor.test(data$distance_to_voronezh, data$daily_internet_usage_pc, method = "spearman")
+cor.test(data$prisoners_per_100K, data$daily_internet_usage_pc, method = "spearman")
+```
+
+For distance_to_voronezh and daily_internet_usage_pc we reject the null hypothesis of having 0 correlation in favor of alternative, that monotonic relationship exist. For other two tests we fail to reject the hypothesis that there is no monotonic or linear relation between these pairs, however we cannot say anything about whether two of the regressors can explain the other.
+
+For our two categorical variables we can test something stronger than correlation, that would be independence. Our options are Chi-Square Test of Independence or Fisher's Exact Test. Let's see if the assumption for Chi-Square Test holds:
+
+```{r}
+data.short <- data
+data.short$nace_r2_sector <- as.character(data.short$nace_r2_sector)
+
+data.short$nace_r2_sector[data.short$nace_r2_sector == "Financial and insurance activities"] <- "Finance"
+data.short$nace_r2_sector[data.short$nace_r2_sector == "Public administration, education, health"] <- "Administration"
+data.short$nace_r2_sector[data.short$nace_r2_sector == "Wholesale, retail, transport, accommodation"] <- "Wholesale"
+
+data.short$nace_r2_sector <- factor(data.short$nace_r2_sector)
+
+ct.table <- table(data.short$lyhin_preference, data.short$nace_r2_sector)
+ct.table
+```
+
+Almost all counts in the table are \< 5, so it is better to use Fisher's Exact Test.
+
+```{r}
+fisher.test(ct.table)
+```
+
+The p-value is very high, so we fail to reject the null hypothesis of independence (i.e., there is no evidence of a statistically significant association between the two categorical variables).
+
+And lastly we will compare means of numerical variables across different categories of nace_r2_sector (we will not test numerical variables relationsip with Lyhin preference, because latter is far too exceptional to be tested here). We start by plotting boxplots.
+
+```{r}
+par(mar = c(5, 4, 4, 8), xpd = TRUE)
+
+boxplot(
+    distance_to_voronezh ~ nace_r2_sector, data = data.short,
+    main = "Distance to Voronezh by NACE2 A10 Categories",
+    ylab = "Distance to Voronezh"
+)
+group_means <- tapply(data.short$distance_to_voronezh, data.short$nace_r2_sector, mean, na.rm = TRUE)
+points(1:length(group_means), group_means, col = "coral", pch = 19)
+       
+boxplot(
+    prisoners_per_100K ~ nace_r2_sector, data = data.short,
+    main = "Prisoners per 100K by NACE2 A10 Categories",
+    ylab = "Prisoners per 100K"
+)
+group_means <- tapply(data.short$prisoners_per_100K, data.short$nace_r2_sector, mean, na.rm = TRUE)
+points(1:length(group_means), group_means, col = "coral", pch = 19)
+
+boxplot(
+    daily_internet_usage_pc ~ nace_r2_sector, data = data.short,
+    main = "Daily internet usage pc by NACE2 A10 Categories",
+    ylab = "Daily internet usage pc"
+)
+group_means <- tapply(data.short$daily_internet_usage_pc, data.short$nace_r2_sector, mean, na.rm = TRUE)
+points(1:length(group_means), group_means, col = "coral", pch = 19)
+```
+
+The plots above show that samples in Administration and Finance categories have comparable means (orange dots) and means are similar also for Industry and Wholesale. Now let's see what ANOVA will tell us about means. ANOVA tests null hypothesis of numerical values means being equal in different categories and alternative hypothesis that at least one mean is different.
+
+But first we need to test the assumptions of normality of residuals and homogenity of variances. But one category (Finance) has only one observation, so we cannot find estimation of its variance. So we will exclude this category and we will compare only means in the three others.
+
+```{r}
+data.short <- data.short[data.short$nace_r2_sector != 'Finance',]
+data.short
+```
+
+For distance_to_voronezh \~ nace_r2_sector cannot use ANOVA, because residuals are not normal (Shapiro-Wilk test rejected null hypothesis):
+
+```{r}
+fit.distance_to_voronezh <- lm(distance_to_voronezh ~ nace_r2_sector, data = data.short)
+shapiro.test(fit.distance_to_voronezh$resid)
+```
+
+So we should use non parametric Kruskal-Wallis test instead of ANOVA.\
+As for other variables we can use ANOVA, because after applying normality test and homogenity of variance test (Bartlett) we fail to reject null hypothesis:
+
+```{r}
+fit.prisoners_per_100K <- lm(prisoners_per_100K ~ nace_r2_sector, data = data.short)
+shapiro.test(fit.prisoners_per_100K$resid)
+bartlett.test(prisoners_per_100K ~ nace_r2_sector, data = data.short)
+
+
+fit.daily_internet_usage_pc <- lm(daily_internet_usage_pc ~ nace_r2_sector, data = data.short)
+shapiro.test(fit.daily_internet_usage_pc$resid)
+bartlett.test(daily_internet_usage_pc ~ nace_r2_sector, data = data.short)
+```
+
+```{r}
+kruskal.test(distance_to_voronezh ~ nace_r2_sector, data = data.short)
+anova(aov(prisoners_per_100K ~ nace_r2_sector, data = data.short))
+anova(aov(daily_internet_usage_pc ~ nace_r2_sector, data = data.short))
+```
+
+Only for daily internet usage with p-value = 0.02 \< $a =0.05$, we reject the null hypothesis and conclude that nace_r2_sector has a statistically significant effect on the mean of daily internet usage.
+
+## Modeling
+
+We will build model without interactions, because we have a big number of regressors and with interactions the number of coefficients will explode and it will be hard to interpret them.
+
+```{r}
+full_model <- lm(values ~ distance_to_voronezh + lyhin_preference + prisoners_per_100K + nace_r2_sector + daily_internet_usage_pc, data=data)
+summary(full_model)
+print(sprintf("RMSE of model: %.2f", sqrt(mean(full_model$residuals ^ 2))))
+```
+
+### **Individual Regressors**
+
+**Statistically Significant Predictors**:
+
+-   *distance_to_voronezh*: Each additional kilometer from Voronezh is associated with an increase of about **4 EUR** in average annual wages per person.
+
+-   *prisoners_per_100K*: An increase of one prisoner per 100 000 inhabitants corresponds to a decrease of roughly **99 EUR** in per‑capita annual wages.
+
+    Next are coefficients from *nace_r2_sector* feature, as a baseline for comparison was chosen *Financial and insurance activities* category (lexicographically):
+
+-   *nace_r2_sectorIndustry*: Regions where the predominant sector is Industry tend to have average annual wages lower by about **25 148 EUR** compared to the reference sector.
+
+-   *nace_r2_sectorPublic administration, education, health*: The Public administration, education, and health sector is associated with per‑capita wages around **20 932 EUR** below the baseline.
+
+-   *nace_r2_sectorWholesale, retail, transport, accommodation*: This sector shows the largest negative effect – approximately **29 737 EUR** lower average wages than the baseline.
+
+    And the last significant regressor:
+
+-   *daily_internet_usage_pc*: A one‑percentage‑point increase in daily internet usage is linked to about 763 EUR higher annual wages per person.
+
+**NOT Statistically Significant**:
+
+-    *Intercept*: estimated as **-3105 EUR** however has a big standard error and is insignificant.
+
+    For ordinal feature *lyhin_preference* R gave an interesting output with .L and .Q suffixes. This is because internally R uses orthogonal polynomial contrasts for ordinal features to capture additional valuable information. So we got:
+
+-   *lyhin_preference.L:* There's a insignificant linear trend, as go from low to mid to high, the outcome tends to increase by **2024 EUR** per step.
+
+-    *lyhin_preference.Q*: Estimate is **1813**, this means that the middle level (e.g., Medium category) is higher than expected if the trend was purely linear, but there is no strong evidence that the relationship between this predictor and regressand is U-shaped.
+
+### Model Performance
+
+-   **Adjusted R-squared: 0.8439 -** The model explains about 84.4% of the variability in average annual wages per-capita, after accounting for the number of predictors.
+
+-   **RMSE: 5 219.36 EUR -** On average, predicted wages deviate from observed values by about 5 219 EUR, reflecting a reasonably tight fit given the scale of wages.
+
+This regression model indicates that **macro‑economic** and **demographic** factors are strong determinants of average annual wages per person (in EUR). Distance from Voronezh also plays a modest but **significant** role, while the preference of our dear Mr. Lyhin shows **no meaningful impact** on wages.
+
+## Outliers
+
+```{r warning=FALSE}
+plot(full_model, which=4)
+plot(full_model, which=5)
+```
+
+```{r}
+largest_cookd <-  data[c(4, 5, 22),]
+largest_cookd$modeled_values <-  predict(full_model, newdata=largest_cookd)
+largest_cookd <- largest_cookd[c("geo", "values", "modeled_values")]
+largest_cookd
+```
+
+The Cook's distance diagnostics Portugal (22) as one of the most influential observations in the model.\
+On the Residuals vs. Leverage plot, Portugal (22) sits in the lower‑right corner – characterized by:
+
+-   **High Leverage (\~0.5):** It lies far to the right on the horizontal axis, meaning Portugal's combination of predictor values is relatively unique compared to the rest of the data.
+
+-   **Large Standardized Residual (\~–2.2):** It's well below zero on the vertical axis, indicating the model's prediction overshoots the actual wage by over two standard deviations.
+
+-   **Outside the Cook's Distance Boundary (dashed lines):** Portugal crosses the 0.5 Cook's distance contour, confirming it has a disproportionaly large influence on the fitted coefficients.
+
+### Multicolinearity
+
+An overview of how much each regressor depends on the others is provided by the **variance inflation factor**, which indicates how well the j-th regressor is explained by the other predictors. In our case, however, we will use **adjusted** **generalized VIF**, because we a have factor variable.
+
+```{r}
+vif(full_model, type = "predictor")
+```
+
+We can be confident that coefficient estimates and standard errors aren't being inflated by collinearity among these variables. (All adjusted GVIF values are \< 2 which in literature is considered a good result).
+
+### Homoscedasticity
+
+Let's see how residuals change with fitted values to see if there are changes in variance.
+
+```{r}
+plot(full_model, which=3)
+largest_scale <-  data[c(5, 22, 1),]
+largest_scale$modeled_values <-  predict(full_model, newdata=largest_scale)
+largest_scale <- largest_scale[c("geo", "values", "modeled_values")]
+largest_scale
+```
+
+The red line shows some fluctuations, which can suggest heteroscedasticity. It is not obvious what to conclude so we will use Breusch-Pagan test.
+
+```{r}
+bptest(full_model)
+```
+
+At the 5% significance level, we **fail to reject** the null hypothesis of homoscedasticity (constant variance), since $p=0.073>0.05$. In other words, there's no strong statistical evidence of heteroscedasticity in our model's residuals.
+
+### Normality of Residuals
+
+We will use two plots: Residuals vs Fitted and Q-Q Plot.
+
+```{r warning=F}
+plot(full_model, which=1)
+plot(full_model, which=2)
+```
+
+Plots:
+
+1.  **Residuals vs. Fitted**: No obvious skew or systematic curvature in the residual–fitted plot.
+
+2.  **Normal Q–Q Plot**: Most points hug the 45° reference line, with only minor deviations at the extremes – consistent with approximate normality.
+
+This suggest that residuals should be normal, but we can also use test to see that.
+
+```{r}
+shapiro.test(full_model$residuals)
+```
+
+**Shapiro–Wilk Test** - Since $p=0.6681>0.05$, we **fail to reject** the null hypothesis that the residuals come from a normal distribution.
+
+The model's residuals appear to be reasonably normally distributed, satisfying the normality assumption for linear regression.
+
+### Choosing submodel
+
+The only assumption that was not met for using linear regression was existence of outliers. But our task is to estimate salary for each european country and it will be unwise to remove some countries. Besides, influence of the outliers is not very severe.
+
+We can try to reduce this model to a submodel using function `step()`, which greedily goes through the variables step by step and If it encounters one whose inclusion reduces the AIC, it will add it to the model and continue until the optimal version is reached:
+
+```{r}
+step(lm(values ~ 1, data = data), 
+     scope = list(lower = ~ 1, upper = ~ distance_to_voronezh + lyhin_preference + prisoners_per_100K + nace_r2_sector + daily_internet_usage_pc), 
+     direction = "both", 
+     data = data)
+```
+
+**Key AIC Improvements**:
+
+-   Adding *daily_internet_usage_pc* dropped AIC from **505.45 to 482.97**, the largest single improvement.
+
+-   Then *prisoners_per_100K* further cut AIC to **475.40**.
+
+-   Including *nace_r2_sector* (all three dummy contrasts) brought AIC down to **466.54**.
+
+-   Finally *distance_to_voronezh* produced the lowest AIC of **460.91**
+
+So we can **interpret** those improvements as:
+
+-   **Internet Usage** and our very original **Distance to Voronezh** remain strong positive predictors.
+
+-   **Prisoner Rate** retains its negative association.
+
+-   **Sectoral Dummies** account for large inter‐sector wage differences and are also informative for the model.
+
+-   ***lyhin_preference*** was never retained, indicating it adds little explanatory power beyond these four core factors.
+
+### Exclusion of *lyhin_preference* ![](https://media1.tenor.com/m/AA5B4MH4aUsAAAAd/disintegrating-aughhh.gif){width="10"}
+
+In each step of the AIC‐driven selection process, adding the linear and quadratic contrasts for *lyhin_preference* failed to reduce the AIC beyond what was achieved with the core predictors. Moreover, in the full model, both the linear and quadratic terms of *lyhin_preference* had high p‑values, providing no evidence that preference of our good old Mr. Lyhin explains additional variation in average wages.
+
+Therefore, dropping *lyhin_preference* yields a simpler model without sacrificing explanatory power.
+
+```{r}
+submodel <- lm(formula = values ~ daily_internet_usage_pc + prisoners_per_100K +  nace_r2_sector + distance_to_voronezh, data = data)
+summary(submodel)
+print(sprintf("RMSE of model: %.2f", sqrt(mean(submodel$residuals ^ 2))))
+```
+
+### Submodel Model Performance
+
+-   **Adjusted R-squared: 0.8505 -** Explains **85.05%** of wage variability – slightly above the full model's 84.39%, despite dropping predictors.
+
+-   **RMSE: 5 401.03 EUR -** A modest increase from the full model's 5 219.36 EUR, reflecting a small trade‑off in average error for greater simplicity.
+
+The submodel maintains strong fit. It's balanced performance makes it a preferred choice for predicting annual wages.
+
+```{r}
+anova(submodel, full_model)
+```
+
+The partial F‐test confirms that adding the two *lyhin_preference* contrasts doesn’t significantly improve fit. Since $p>0.05$, we **fail to reject** the null hypothesis that the smaller model (without *lyhin_preference*) is as good as the full model. In other words, those two terms do not explain a statistically significant amount of additional variance, reinforcing their exclusion for simplicity.
+
+## Conclusion
+
+Our selection of regressors resulted in a linear model that effectively describes average salary in European countries. It was surprising to discover that chosen regressors was all unique and strong in their own way. There was little correlation between them and this was one of the reasons why almost all assumption were satisfied for the use of linear model.
